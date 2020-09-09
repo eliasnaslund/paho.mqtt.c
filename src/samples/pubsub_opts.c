@@ -55,7 +55,7 @@ void usage(struct pubsub_opts* opts, pubsub_opts_nameValue* name_values, const c
 		printf("       [-R] [--no-delimiter]\n");
 	printf("       [--will-topic topic] [--will-payload message] [--will-qos qos] [--will-retain]\n");
 	printf("       [--cafile filename] [--capath dirname] [--cert filename] [--key filename]\n"
-		   "       [--keypass string] [--ciphers string] [--insecure]");
+		   "       [--keypass string] [--ciphers string] [--insecure] [--check-revocation]");
 
 	printf(
 	"\n\n  -t (--topic)        : MQTT topic to %s to\n"
@@ -115,6 +115,7 @@ void usage(struct pubsub_opts* opts, pubsub_opts_nameValue* name_values, const c
 	"  --ciphers           : the list of cipher suites that the client will present to the server during\n"
 	"                        the TLS handshake.\n"
 	"  --insecure          : don't check that the server certificate common name matches the hostname.\n"
+	"  --check-revocation  : check if certificate is revoked with OCSP.\n"
 	"  --psk               : pre-shared-key in hexadecimal (no leading 0x) \n"
 	"  --psk-identity      : client identity string for TLS-PSK mode.\n"
 	);
@@ -259,6 +260,8 @@ int getopts(int argc, char** argv, struct pubsub_opts* opts)
 		}
 		else if (strcmp(argv[count], "--insecure") == 0)
 			opts->insecure = 1;
+		else if (strcmp(argv[count], "--check-revocation") == 0)
+			opts->revocation = 1;
 		else if (strcmp(argv[count], "--capath") == 0)
 		{
 			if (++count < argc)

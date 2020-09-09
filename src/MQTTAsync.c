@@ -3231,7 +3231,7 @@ int MQTTAsync_connect(MQTTAsync handle, const MQTTAsync_connectOptions* options)
 	}
 	if (options->struct_version != 0 && options->ssl) /* check validity of SSL options structure */
 	{
-		if (strncmp(options->ssl->struct_id, "MQTS", 4) != 0 || options->ssl->struct_version < 0 || options->ssl->struct_version > 4)
+		if (strncmp(options->ssl->struct_id, "MQTS", 4) != 0 || options->ssl->struct_version < 0 || options->ssl->struct_version > 5)
 		{
 			rc = MQTTASYNC_BAD_STRUCTURE;
 			goto exit;
@@ -3425,6 +3425,10 @@ int MQTTAsync_connect(MQTTAsync handle, const MQTTAsync_connectOptions* options)
 			m->c->sslopts->ssl_psk_cb = options->ssl->ssl_psk_cb;
 			m->c->sslopts->ssl_psk_context = options->ssl->ssl_psk_context;
 			m->c->sslopts->disableDefaultTrustStore = options->ssl->disableDefaultTrustStore;
+		}
+		if (m->c->sslopts->struct_version >= 5)
+		{
+			m->c->sslopts->check_revocation = options->ssl->check_revocation;
 		}
 	}
 #else

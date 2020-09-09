@@ -742,9 +742,16 @@ typedef struct
 	 */
 	int disableDefaultTrustStore;
 
+	/**
+	 * Check if certificate is revoked. If the certificate is revoked or the
+	 * OCSP request fails, no connection is established
+	 * Exists only if struct_version >= 5
+	 */
+	int check_revocation;
+
 } MQTTClient_SSLOptions;
 
-#define MQTTClient_SSLOptions_initializer { {'M', 'Q', 'T', 'S'}, 4, NULL, NULL, NULL, NULL, NULL, 1, MQTT_SSL_VERSION_DEFAULT, 0, NULL, NULL, NULL, NULL, NULL, 0 }
+#define MQTTClient_SSLOptions_initializer { {'M', 'Q', 'T', 'S'}, 5, NULL, NULL, NULL, NULL, NULL, 1, MQTT_SSL_VERSION_DEFAULT, 0, NULL, NULL, NULL, NULL, NULL, 0, 0 }
 
 /**
   * MQTTClient_libraryInfo is used to store details relating to the currently used

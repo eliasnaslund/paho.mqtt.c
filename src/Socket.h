@@ -79,6 +79,14 @@
 #define TCPSOCKET_INTERRUPTED -22
 #define SSL_FATAL -3
 
+#define SSL_OCSP_OK 0
+#define SSL_OCSP_NOT_AVAILABLE 1
+#define SSL_OCSP_REVOKED -4
+#define SSL_OCSP_ERROR -5
+#define SSL_OCSP_UNKNOWN -6
+#define SSL_OCSP_INVALID -7
+#define SSL_OCSP_NO_RESPONSE -8
+
 #if !defined(INET6_ADDRSTRLEN)
 #define INET6_ADDRSTRLEN 46 /** only needed for gcc/cygwin on windows */
 #endif

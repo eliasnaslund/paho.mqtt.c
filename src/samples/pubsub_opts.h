@@ -55,6 +55,7 @@ struct pubsub_opts
 	int will_retain;
 	/* TLS options */
 	int insecure;
+	int revocation;
 	char* capath;
 	char* cert;
 	char* cafile;

@@ -40,6 +40,7 @@
 
 #include <string.h>
 #include <openssl/ssl.h>
+#include <openssl/ocsp.h>
 #include <openssl/err.h>
 #include <openssl/crypto.h>
 #include <openssl/x509v3.h>
@@ -680,6 +681,413 @@ exit:
 	return rc;
 }
 
+static OCSP_RESPONSE *get_ocsp_response(OCSP_REQUEST *req, const char *url)
+{
+	char *host = NULL, *port = NULL, *path = NULL;
+	int ssl, res, fd, timeout = 10;
+	OCSP_RESPONSE *resp = NULL;
+	BIO *connection_bio = NULL;
+	SSL_CTX *ssl_ctx = NULL;
+	OCSP_REQ_CTX *req_ctx = NULL;
+	fd_set fds;
+	struct timeval tv;
+
+	if (!OCSP_parse_url(url, &host, &port, &path, &ssl))
+	{
+		Log(LOG_ERROR, -1, "Error parsing url");
+		goto end;
+	}
+
+	if (NULL == (connection_bio = BIO_new_connect(host)))
+	{
+		Log(LOG_ERROR, -1, "Error creating connect BIO");
+		goto end;
+	}
+
+	BIO_set_conn_port(connection_bio, port);
+
+	if (1 == ssl)
+	{
+		BIO *ssl_bio;
+		ssl_ctx = SSL_CTX_new(TLS_client_method());
+		if (NULL == ssl_ctx)
+		{
+			Log(LOG_ERROR, -1, "Error creating SSL context");
+			goto end;
+		}
+		SSL_CTX_set_mode(ssl_ctx, SSL_MODE_AUTO_RETRY);
+		ssl_bio = BIO_new_ssl(ssl_ctx, 1);
+
+		if (NULL == ssl_bio)
+		{
+			Log(LOG_ERROR, -1, "Error creating SSL BIO");
+			goto end;
+		}
+
+		connection_bio = BIO_push(ssl_bio, connection_bio);
+	}
+
+	// Set non-blocking
+	BIO_set_nbio(connection_bio, 1);
+
+	for (int i = 0; i < 3; i++)
+	{
+		if ((res = BIO_do_connect(connection_bio)) > 0)
+		{
+			break;
+		}
+
+		if ((fd = BIO_get_fd(connection_bio, NULL)) < 0)
+		{
+			Log(LOG_ERROR, -1, "Can't get fd");
+			goto end;
+		}
+
+		if (!BIO_should_retry(connection_bio))
+		{
+			Log(LOG_ERROR, -1, "Error connecting");
+			goto end;
+		}
+
+		FD_ZERO(&fds);
+		FD_SET(fd, &fds);
+		tv.tv_usec = 0;
+		tv.tv_sec = timeout;
+		if ((res = select(fd + 1, NULL, &fds, NULL, &tv)) < 1)
+		{
+			Log(LOG_ERROR, -1, "Timeout or error on connect");
+			goto end;
+		}
+	}
+
+	// Since we must set Host we cannot add req here...
+	// https://unmitigatedrisk.com/?p=143
+	req_ctx = OCSP_sendreq_new(connection_bio, path, NULL, 0);
+	if (NULL == req_ctx)
+		goto end;
+
+	if (OCSP_REQ_CTX_add1_header(req_ctx, "Host", host) < 1)
+		goto end;
+
+	if (OCSP_REQ_CTX_set1_req(req_ctx, req) < 1)
+		goto end;
+
+	for (;;)
+	{
+		// Documentation says it can only return 0 or 1. That is not true...
+		if (OCSP_sendreq_nbio(&resp, req_ctx) >= 0)
+			break;
+
+		FD_ZERO(&fds);
+		FD_SET(fd, &fds);
+		tv.tv_usec = 0;
+		tv.tv_sec = timeout;
+
+		if (BIO_should_read(connection_bio))
+			res = select(fd + 1, &fds, NULL, NULL, &tv);
+		else if (BIO_should_write(connection_bio))
+			res = select(fd + 1, NULL, &fds, NULL, &tv);
+		else
+		{
+			Log(LOG_ERROR, -1, "Unexpected retry condition");
+			goto end;
+		}
+
+		if (res < 1)
+		{
+			Log(LOG_ERROR, -1, "Timeout or error on connect");
+			goto end;
+		}
+	}
+
+end:
+	BIO_free_all(connection_bio);
+	SSL_CTX_free(ssl_ctx);
+	OCSP_REQ_CTX_free(req_ctx);
+	OPENSSL_free(host);
+	OPENSSL_free(path);
+	OPENSSL_free(port);
+
+	return resp;
+}
+
+static int check_revoked(OCSP_BASICRESP *br, OCSP_CERTID *id)
+{
+	int status, reason, ret = SSL_OCSP_UNKNOWN;
+	ASN1_GENERALIZEDTIME *revtime, *thisupd, *nextupd;
+	struct tm time;
+
+	if (OCSP_resp_find_status(br, id, &status, &reason, &revtime, &thisupd, &nextupd) < 1)
+	{
+		Log(TRACE_PROTOCOL, -1, "No OCSP status found");
+		return SSL_OCSP_UNKNOWN;
+	}
+
+	if (NULL != thisupd)
+	{
+		ASN1_TIME_to_tm(thisupd, &time);
+		Log(TRACE_PROTOCOL, -1, "This Update: %s", asctime(&time));
+	}
+
+	if (NULL != nextupd)
+	{
+		ASN1_TIME_to_tm(nextupd, &time);
+		Log(TRACE_PROTOCOL, -1, "Next Update: %s", asctime(&time));
+	}
+
+	switch (status)
+	{
+	case V_OCSP_CERTSTATUS_GOOD:
+		// Allow thisupd to be 1 minute in future
+		if (OCSP_check_validity(thisupd, nextupd, 60, -1) < 1)
+		{
+			Log(LOG_ERROR, -1, "OCSP response has expired");
+			ret = SSL_OCSP_INVALID;
+		}
+		else
+			ret = SSL_OCSP_OK;
+
+		break;
+
+	case V_OCSP_CERTSTATUS_REVOKED:
+		Log(TRACE_PROTOCOL, -1, "Cert revoked due to: %s (%d)", OCSP_crl_reason_str(reason), reason);
+
+		if (NULL != revtime)
+		{
+			ASN1_TIME_to_tm(revtime, &time);
+			Log(TRACE_PROTOCOL, -1, "Revocation time: %s", asctime(&time));
+		}
+
+		ret = SSL_OCSP_REVOKED;
+		break;
+
+	case V_OCSP_CERTSTATUS_UNKNOWN:
+	default:
+		Log(LOG_ERROR, -1, "Unknown OCSP certificate status");
+		ret = SSL_OCSP_UNKNOWN;
+		break;
+	}
+
+	return ret;
+}
+
+static int valid_response(OCSP_BASICRESP *br, STACK_OF(X509) *chain, X509_STORE *store)
+{
+	int valid;
+
+	if (NULL == br)
+		return 0;
+
+	valid = OCSP_basic_verify(br, chain, store, 0);
+	if (valid > 0)
+	{
+		Log(TRACE_PROTOCOL, -1, "Response verify OK");
+		return 1;
+	}
+	else if (valid < 0)
+	{
+		Log(LOG_ERROR, -1, "Fatal error, such as malloc failure");
+		return -1;
+	}
+	else
+	{
+		Log(LOG_ERROR, -1, "Response Verify Failure");
+		return 0;
+	}
+}
+
+static OCSP_BASICRESP *get_basicresp(OCSP_RESPONSE *resp)
+{
+	int responder_status;
+
+	if (NULL == resp)
+		return NULL;
+
+	responder_status = OCSP_response_status(resp);
+
+	if (OCSP_RESPONSE_STATUS_SUCCESSFUL != responder_status) {
+		Log(LOG_ERROR, -1, "Invalid response %d", responder_status);
+		return NULL;
+	}
+
+	return OCSP_response_get1_basic(resp);
+}
+
+static int query_ocsp_servers(OCSP_CERTID *id, X509 *cert, STACK_OF(X509) *chain, X509_STORE *store)
+{
+	int ret = SSL_OCSP_UNKNOWN, nonce;
+	int ocsp_url_count = 0;
+	STACK_OF(OPENSSL_STRING) *ocsp_list = NULL;
+	char *buf = NULL;
+	OCSP_REQUEST *req = OCSP_REQUEST_new();
+
+	if (NULL == req)
+	{
+		Log(LOG_ERROR, -1, "Error Creating OCSP request");
+		ret = SSL_OCSP_ERROR;
+		goto end;
+	}
+
+	if (NULL == OCSP_request_add0_id(req, id))
+	{
+		ret = SSL_OCSP_ERROR;
+		Log(LOG_ERROR, -1, "Error adding id to OCSP request");
+		goto end;
+	}
+
+	ocsp_list = X509_get1_ocsp(cert);
+	ocsp_url_count = sk_OPENSSL_STRING_num(ocsp_list);
+
+	if (0 == ocsp_url_count)
+	{
+		ret = SSL_OCSP_NOT_AVAILABLE;
+		goto end;
+	}
+
+	for (int i = 0; i < ocsp_url_count; i++)
+	{
+		char *ocsp_url = sk_OPENSSL_STRING_value(ocsp_list, i);
+		OCSP_RESPONSE *resp = get_ocsp_response(req, ocsp_url);
+		if (NULL != resp)
+		{
+			OCSP_BASICRESP *br = get_basicresp(resp);
+			if ((nonce = OCSP_check_nonce(req, br)) > 0)
+			{
+				if (1 == valid_response(br, chain, store))
+					ret = check_revoked(br, id);
+				else
+					ret = SSL_OCSP_INVALID;
+			}
+			else if (0 == nonce)
+			{
+				Log(LOG_ERROR, -1, "Nonce is present but not equal");
+				ret = SSL_OCSP_INVALID;
+			}
+			else if (-1 == nonce)
+			{
+				Log(LOG_ERROR, -1, "No nonce in response");
+				ret = SSL_OCSP_INVALID;
+			}
+			else
+			{
+				Log(LOG_ERROR, -1, "Unknown nonce error: %d", nonce);
+				ret = SSL_OCSP_INVALID;
+			}
+
+			OCSP_BASICRESP_free(br);
+			OCSP_RESPONSE_free(resp);
+		}
+		else
+		{
+			ret = SSL_OCSP_NO_RESPONSE;
+			Log(LOG_ERROR, -1, "Error retrieving response from %s", ocsp_url);
+		}
+
+		if (SSL_OCSP_OK == ret || SSL_OCSP_REVOKED == ret)
+			break;
+	}
+
+end:
+	X509_email_free(ocsp_list);
+	OCSP_REQUEST_free(req);
+
+	return ret;
+}
+
+/*
+ * * Chain is ordered and cannot be empty
+ * * A CA cannot be revoked. Thus no point in trying to check OCSP for the CA.
+ */
+static int check_ocsp(OCSP_RESPONSE *resp, STACK_OF(X509) *chain, X509_STORE *store)
+{
+	int ret = SSL_OCSP_UNKNOWN;
+	char *cert_name = NULL, *issuer_name = NULL;
+	X509 *cert = NULL, *issuer = NULL;
+	OCSP_BASICRESP *br = get_basicresp(resp);
+
+	// Invalidate br if it is not valid
+	if (1 != valid_response(br, chain, store))
+	{
+		OCSP_BASICRESP_free(br);
+		br = NULL;
+		ret = SSL_OCSP_INVALID;
+	}
+
+	// Check OCSP for all certs but CA
+	for (int i = 0; i < sk_X509_num(chain) - 1; i++)
+	{
+		ret = SSL_OCSP_UNKNOWN;
+
+		cert = sk_X509_value(chain, i);
+		issuer = sk_X509_value(chain, i + 1);
+
+		cert_name = X509_NAME_oneline(X509_get_subject_name(cert), NULL, 0);
+		issuer_name = X509_NAME_oneline(X509_get_subject_name(issuer), NULL, 0);
+
+		Log(LOG_PROTOCOL, -1, "cert: %s with issuer: %s", cert_name, issuer_name);
+
+		OCSP_CERTID *id = OCSP_cert_to_id(NULL, cert, issuer);
+
+		// First check if we got OCSP status from TLS connection, if not fallback
+		// on asking OCSP server
+		if (NULL != br)
+			ret = check_revoked(br, id);
+		if (SSL_OCSP_OK != ret && SSL_OCSP_REVOKED != ret)
+			ret = query_ocsp_servers(id, cert, chain, store);
+
+		Log(LOG_PROTOCOL, -1, "cert %s is revoked: %d", cert_name, ret);
+
+		OPENSSL_free(cert_name);
+		OPENSSL_free(issuer_name);
+
+		// No need to further check if current certificate is not OK, only
+		// exception is if OCSP is not available for one of the certificates. In
+		// this case we still want to make sure the rest isn't revoked.
+		if (SSL_OCSP_OK != ret && SSL_OCSP_NOT_AVAILABLE != ret)
+			break;
+	}
+
+	if (NULL != br)
+		OCSP_BASICRESP_free(br);
+
+	return ret;
+}
+
+static int ocsp_cb(SSL *ssl, void *arg)
+{
+	networkHandles *net = (networkHandles *)arg;
+	const unsigned char *rsp;
+	int len;
+	OCSP_RESPONSE *resp = NULL;
+
+	len = SSL_get_tlsext_status_ocsp_resp(ssl, &rsp);
+
+	if (len > 0)
+		resp = d2i_OCSP_RESPONSE(NULL, &rsp, len);
+
+	Log(LOG_PROTOCOL, -1, "TLS OCSP resp len %d, resp %d", len, resp);
+
+	X509_STORE *store = SSL_CTX_get_cert_store(net->ctx);
+	STACK_OF(X509) *chain = SSL_get0_verified_chain(ssl);
+
+	if (NULL == store || NULL == chain)
+	{
+		Log(LOG_ERROR, -1, "store is %p, chain is %p", store, chain);
+		return 0; // fail
+	}
+
+	int status = check_ocsp(resp, chain, store);
+
+	Log(LOG_PROTOCOL, -1, "OCSP status: %d", status);
+
+	if (SSL_OCSP_OK != status && SSL_OCSP_NOT_AVAILABLE != status)
+	{
+		Log(LOG_ERROR, -1, "OCSP failed with code %d", status);
+		return 0; // fail
+	}
+
+	return 1; // OK
+}
 
 int SSLSocket_setSocketForSSL(networkHandles* net, MQTTClient_SSLOptions* opts,
 	const char* hostname, size_t hostname_len)
@@ -695,8 +1103,17 @@ int SSLSocket_setSocketForSSL(networkHandles* net, MQTTClient_SSLOptions* opts,
 
 		SSL_CTX_set_info_callback(net->ctx, SSL_CTX_info_callback);
 		SSL_CTX_set_msg_callback(net->ctx, SSL_CTX_msg_callback);
-   		if (opts->enableServerCertAuth)
+		if (opts->enableServerCertAuth)
 			SSL_CTX_set_verify(net->ctx, SSL_VERIFY_PEER, NULL);
+
+#if (OPENSSL_VERSION_NUMBER >= 0x010100000) /* 1.1.0 and later */
+		if (opts->check_revocation)
+		{
+			SSL_CTX_set_tlsext_status_type(net->ctx, TLSEXT_STATUSTYPE_ocsp);
+			SSL_CTX_set_tlsext_status_cb(net->ctx, ocsp_cb);
+			SSL_CTX_set_tlsext_status_arg(net->ctx, net);
+		}
+#endif
 
 		net->ssl = SSL_new(net->ctx);
 
